@@ -69,12 +69,12 @@
 
 #define VIDEO_WIDTH     640
 #define VIDEO_HEIGHT    480
-#define MODEL_WIDTH     300
-#define MODEL_HEIGHT    300
+#define MODEL_WIDTH     320
+#define MODEL_HEIGHT    320
 
-#define BOX_SIZE        4
-#define LABEL_SIZE      91
-#define DETECTION_MAX   1917
+#define SCORE_SIZE      4
+#define GEOMETRY_SIZE   4
+#define DETECTION_MAX   80
 
 /**
  * @brief Max objects in display.
@@ -104,8 +104,6 @@ typedef struct
 {
   gchar *model_path; /**< tflite model file path */
   gchar *label_path; /**< label file path */
-  gchar *box_prior_path; /**< box prior file path */
-  gfloat box_priors[BOX_SIZE][DETECTION_MAX]; /**< box prior */
   GList *labels; /**< list of loaded labels */
 } TFLiteModelInfo;
 
@@ -149,47 +147,6 @@ read_lines (const gchar * file_name, GList ** lines)
   return TRUE;
 }
 
-/**
- * @brief Load box priors.
- */
-static gboolean
-tflite_load_box_priors (TFLiteModelInfo * tflite_info)
-{
-  GList *box_priors = NULL;
-  gchar *box_row;
-
-  g_return_val_if_fail (tflite_info != NULL, FALSE);
-  g_return_val_if_fail (read_lines (tflite_info->box_prior_path, &box_priors),
-      FALSE);
-
-  for (int row = 0; row < BOX_SIZE; row++) {
-    int column = 0;
-    int i = 0, j = 0;
-    char buff[11];
-
-    memset (buff, 0, 11);
-    box_row = (gchar *) g_list_nth_data (box_priors, row);
-
-    while ((box_row[i] != '\n') && (box_row[i] != '\0')) {
-      if (box_row[i] != ' ') {
-        buff[j] = box_row[i];
-        j++;
-      } else {
-        if (j != 0) {
-          tflite_info->box_priors[row][column++] = atof (buff);
-          memset (buff, 0, 11);
-        }
-        j = 0;
-      }
-      i++;
-    }
-
-    tflite_info->box_priors[row][column++] = atof (buff);
-  }
-
-  g_list_free_full (box_priors, g_free);
-  return TRUE;
-}
 
 /**
  * @brief Load labels.
@@ -208,34 +165,16 @@ tflite_load_labels (TFLiteModelInfo * tflite_info)
 static gboolean
 tflite_init_info (TFLiteModelInfo * tflite_info, const gchar * path)
 {
-  const gchar tflite_model[] = "ssd_mobilenet_v2_coco.tflite";
-  const gchar tflite_label[] = "coco_labels_list.txt";
-  const gchar tflite_box_priors[] = "box_priors.txt";
+  const gchar tflite_model[] = "east_model_dr.tflite";
 
   g_return_val_if_fail (tflite_info != NULL, FALSE);
 
   tflite_info->model_path = g_strdup_printf ("%s/%s", path, tflite_model);
-  tflite_info->label_path = g_strdup_printf ("%s/%s", path, tflite_label);
-  tflite_info->box_prior_path =
-      g_strdup_printf ("%s/%s", path, tflite_box_priors);
-
-  tflite_info->labels = NULL;
 
   if (!g_file_test (tflite_info->model_path, G_FILE_TEST_IS_REGULAR)) {
     g_critical ("cannot find tflite model [%s]", tflite_info->model_path);
     return FALSE;
   }
-  if (!g_file_test (tflite_info->label_path, G_FILE_TEST_IS_REGULAR)) {
-    g_critical ("cannot find tflite label [%s]", tflite_info->label_path);
-    return FALSE;
-  }
-  if (!g_file_test (tflite_info->box_prior_path, G_FILE_TEST_IS_REGULAR)) {
-    g_critical ("cannot find tflite box_prior [%s]", tflite_info->box_prior_path);
-    return FALSE;
-  }
-
-  g_return_val_if_fail (tflite_load_box_priors (tflite_info), FALSE);
-  g_return_val_if_fail (tflite_load_labels (tflite_info), FALSE);
 
   return TRUE;
 }
@@ -251,21 +190,6 @@ tflite_free_info (TFLiteModelInfo * tflite_info)
   if (tflite_info->model_path) {
     g_free (tflite_info->model_path);
     tflite_info->model_path = NULL;
-  }
-
-  if (tflite_info->label_path) {
-    g_free (tflite_info->label_path);
-    tflite_info->label_path = NULL;
-  }
-
-  if (tflite_info->box_prior_path) {
-    g_free (tflite_info->box_prior_path);
-    tflite_info->box_prior_path = NULL;
-  }
-
-  if (tflite_info->labels) {
-    g_list_free_full (tflite_info->labels, g_free);
-    tflite_info->labels = NULL;
   }
 }
 
@@ -461,23 +385,22 @@ nms (std::vector<DetectedObject> &detected)
  * @brief Get detected objects.
  */
 static void
-get_detected_objects (gfloat * detections, gfloat * boxes)
+get_detected_objects (gfloat * _scores, gfloat * _geometry)
 {
   const float threshold_score = .5f;
   std::vector<DetectedObject> detected;
 
-  for (int d = 0; d < DETECTION_MAX; d++) {
-    float ycenter =
-        boxes[0] / Y_SCALE * g_app.tflite_info.box_priors[2][d] +
-        g_app.tflite_info.box_priors[0][d];
-    float xcenter =
-        boxes[1] / X_SCALE * g_app.tflite_info.box_priors[3][d] +
-        g_app.tflite_info.box_priors[1][d];
-    float h =
-        (float) expf (boxes[2] / H_SCALE) * g_app.tflite_info.box_priors[2][d];
-    float w =
-        (float) expf (boxes[3] / W_SCALE) * g_app.tflite_info.box_priors[3][d];
+  gfloat scores[DETECTION_MAX][DETECTION_MAX][1] = _scores;
+  gfloat geometry[DETECTION_MAX][DETECTION_MAX][5] = _geometry;
+  /* (1, 80, 80, 1) (1, 80, 80, 5) */
 
+  for (int d = 0; d < DETECTION_MAX; d++) {
+    scoresData = scores[y];
+    xData0 = geometry[0][y];
+    xData1 = geometry[1][y];
+    xData2 = geometry[2][y];
+    xData3 = geometry[3][y];
+    anglesData = geometry[4][y];
     float ymin = ycenter - h / 2.f;
     float xmin = xcenter - w / 2.f;
     float ymax = ycenter + h / 2.f;
@@ -490,12 +413,7 @@ get_detected_objects (gfloat * detections, gfloat * boxes)
 
     for (int c = 1; c < LABEL_SIZE; c++) {
       gfloat score = _expit (detections[c]);
-      /**
-       * This score cutoff is taken from Tensorflow's demo app.
-       * There are quite a lot of nodes to be run to convert it to the useful possibility
-       * scores. As a result of that, this cutoff will cause it to lose good detections in
-       * some scenarios and generate too much noise in other scenario.
-       */
+
       if (score < threshold_score)
         continue;
 
@@ -524,38 +442,32 @@ get_detected_objects (gfloat * detections, gfloat * boxes)
 static void
 new_data_cb (GstElement * element, GstBuffer * buffer, gpointer user_data)
 {
-  GstMemory *mem_boxes, *mem_detections;
-  GstMapInfo info_boxes, info_detections;
-  gfloat *boxes, *detections;
+  GstMemory *mem_scores, *mem_geometry;
+  GstMapInfo info_scores, info_geometry;
+  gfloat *scores, *geometry;
 
   g_return_if_fail (g_app.running);
 
-  /**
-   * tensor type is float32.
-   * [0] dim of boxes > BOX_SIZE : 1 : DETECTION_MAX : 1 (4:1:1917:1)
-   * [1] dim of labels > LABEL_SIZE : DETECTION_MAX : 1 (91:1917:1)
-   */
   g_assert (gst_buffer_n_memory (buffer) == 2);
 
-  /* boxes */
-  mem_boxes = gst_buffer_get_memory (buffer, 0);
-  g_assert (gst_memory_map (mem_boxes, &info_boxes, GST_MAP_READ));
-  g_assert (info_boxes.size == BOX_SIZE * DETECTION_MAX * 4);
-  boxes = (gfloat *) info_boxes.data;
+  mem_scores = gst_buffer_get_memory (buffer, 0);
+  g_assert (gst_memory_map (mem_scores, &info_scores, GST_MAP_READ));
+  g_assert (info_scores.size == SCORE_SIZE * DETECTION_MAX);
+  scores = (gfloat *) info_scores.data;
 
   /* detections */
-  mem_detections = gst_buffer_get_memory (buffer, 1);
-  g_assert (gst_memory_map (mem_detections, &info_detections, GST_MAP_READ));
-  g_assert (info_detections.size == LABEL_SIZE * DETECTION_MAX * 4);
-  detections = (gfloat *) info_detections.data;
+  mem_geometry = gst_buffer_get_memory (buffer, 1);
+  g_assert (gst_memory_map (mem_geometry, &info_geometry, GST_MAP_READ));
+  g_assert (info_geometry.size == GEOMETRY_SIZE * DETECTION_MAX * 5);
+  geometry = (gfloat *) info_geometry.data;
 
-  get_detected_objects (detections, boxes);
+  get_detected_objects (scores, geometry);
 
-  gst_memory_unmap (mem_boxes, &info_boxes);
-  gst_memory_unmap (mem_detections, &info_detections);
+  gst_memory_unmap (mem_scores, &info_scores);
+  gst_memory_unmap (mem_geometry, &info_geometry);
 
-  gst_memory_unref (mem_boxes);
-  gst_memory_unref (mem_detections);
+  gst_memory_unref (mem_scores);
+  gst_memory_unref (mem_geometry);
 }
 
 /**
@@ -689,13 +601,20 @@ main (int argc, char ** argv)
   /* init pipeline */
   str_pipeline =
       g_strdup_printf
-      ("v4l2src name=src ! videoconvert ! videoscale ! "
-      "video/x-raw,width=%d,height=%d,format=RGB ! tee name=t_raw "
-      "t_raw. ! queue ! videoconvert ! cairooverlay name=tensor_res ! ximagesink name=img_tensor "
-      "t_raw. ! queue leaky=2 max-size-buffers=2 ! videoscale ! video/x-raw,width=%d,height=%d ! tensor_converter ! "
-      "tensor_transform mode=arithmetic option=typecast:float32,add:-127.5,div:127.5 ! "
-      "tensor_filter framework=tensorflow-lite model=%s ! "
-      "tensor_sink name=tensor_sink",
+      // ("v4l2src name=src ! videoconvert ! videoscale ! "
+      // "video/x-raw,width=%d,height=%d,format=RGB ! tee name=t_raw "
+      // "t_raw. ! queue ! videoconvert ! cairooverlay name=tensor_res ! ximagesink name=img_tensor "
+      // "t_raw. ! queue leaky=2 max-size-buffers=2 ! videoscale ! video/x-raw,width=%d,height=%d ! tensor_converter ! "
+      // "tensor_transform mode=arithmetic option=typecast:float32,add:-127.5,div:127.5 ! "
+      // "tensor_filter framework=tensorflow-lite model=%s ! "
+      // "tensor_sink name=tensor_sink",
+      ("v4l2src ! videoconvert ! videoscale ! "
+       "video/x-raw,width=%d,height=%d,framerate=5/1,format=RGB ! tee name=t "
+       "t. ! queue ! tensor_converter ! cairooverlay name=tensor_res ! ximagesink name=img_tensor "
+       "t. ! queue leaky=2 max-size-buffers=2 ! videoscale ! video/x-raw,width=%d,height=%d ! tensor_converter ! "
+       "tensor_transform mode=arithmetic option=typecast:float32,add:-127.5,div:127.5 ! "
+       "tensor_filter framework=tensorflow-lite model=%s ! "
+       "tensor_sink name=tensor_sink",
       VIDEO_WIDTH, VIDEO_HEIGHT, MODEL_WIDTH, MODEL_HEIGHT,
       g_app.tflite_info.model_path);
 
